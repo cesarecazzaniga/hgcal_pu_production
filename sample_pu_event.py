@@ -786,7 +786,20 @@ def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_e
     given). vline_x/vline_label: optional dotted vertical marker (e.g. to
     flag a 'prompt' bin bolted onto an otherwise-continuous axis, see
     sample_local_pu_around_probe.py's displacement_log10d_cone.png) -- a
-    plain visual cue, does not affect any of the plotted values."""
+    plain visual cue, does not affect any of the plotted values.
+
+    The ratio panel always compares "sampled" against whichever OTHER
+    curve is the better ground truth: npz truth when given (npz/recipe
+    both independent of sampled, so both get a ratio line), otherwise
+    recipe (the only other curve left). FIXED BUG: this used to nest BOTH
+    ratio lines (recipe/npz AND sampled/npz) inside "if npz_counts is not
+    None", so with no --npz the ratio panel was silently left completely
+    EMPTY -- no sampled/recipe ratio was ever drawn even though recipe_
+    shape was available and sampled_shape is always available. The main
+    panel's sampled curve (dashed blue) was still drawn in that case, just
+    with no ratio to accompany it, and it can visually disappear under an
+    exactly-overlapping solid recipe curve -- easy to misread as "the PU
+    gun curve isn't there at all" when really only the ratio was missing."""
     widths = np.diff(edges)
     centers = .5 * (edges[:-1] + edges[1:])
     sampled_shape = _shape_density(sampled_counts, widths)
@@ -801,6 +814,12 @@ def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_e
                      color='#bd1f01', linewidth=1.6, label='recipe / npz')
         rax.step(centers, _safe_ratio(sampled_shape, npz_shape), where='mid',
                  color='#3f90da', linewidth=1.6, label='sampled / npz')
+    elif recipe_shape is not None:
+        # No npz truth to compare against -- fall back to the only other
+        # curve available, so the ratio panel isn't left empty (see FIXED
+        # BUG note above).
+        rax.step(centers, _safe_ratio(sampled_shape, recipe_shape), where='mid',
+                 color='#3f90da', linewidth=1.6, label='sampled / recipe')
     if recipe_shape is not None:
         ax.step(centers, recipe_shape, where='mid', color='#bd1f01', linewidth=2,
                 label='recipe (own bins)')
@@ -824,7 +843,9 @@ def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_e
         # visually run into each other.
         ax.text(0.02, 0.97, title_extra.strip(), transform=ax.transAxes, ha='left', va='top',
                 fontsize=14, fontweight='bold')
-    rax.set_xlabel(xlabel); rax.set_ylim(*ratio_ylim); rax.legend(fontsize=10)
+    rax.set_xlabel(xlabel); rax.set_ylim(*ratio_ylim)
+    if npz_counts is not None or recipe_shape is not None:
+        rax.legend(fontsize=10)
     rax.set_ylabel('ratio of\nshapes')
     _add_cms_label(ax, cms_label)
     _save(fig, outfile)
