@@ -265,7 +265,11 @@ def estimate_event_pv(event_idx, pdgId, vx, vy, vz, n_events):
 def load_npz(npz_path, displaced_threshold):
     """Ground truth, computed directly from extract_gensim_particles.py's
     output with no recipe involved. Returns per-particle arrays plus the
-    per-event PV subtraction needed to measure displacement."""
+    per-event PV subtraction needed to measure displacement. 'phi' is
+    included (when present in the npz) so consumers that need real
+    angular position -- e.g. sample_local_pu_around_probe.py's radial-
+    profile closure test -- can compute an actual ΔR against some probe
+    direction; nothing in THIS script's own plots uses it."""
     d = np.load(npz_path)
     event_idx = d['event_idx']
     pdgId = d['pdgId']
@@ -282,8 +286,11 @@ def load_npz(npz_path, displaced_threshold):
     dz = d['vz'].astype(np.float64) - pv_z[event_idx]
     d3d = np.sqrt(dx**2 + dy**2 + dz**2)
 
-    return dict(pdgId=pdgId, pt=pt, eta=eta, p=p, d3d=d3d,
-                displaced=d3d > displaced_threshold, n_events=n_events)
+    out = dict(pdgId=pdgId, pt=pt, eta=eta, p=p, d3d=d3d,
+               displaced=d3d > displaced_threshold, n_events=n_events)
+    if 'phi' in d.files:
+        out['phi'] = d['phi'].astype(np.float64)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +655,55 @@ def aggregate_recipe_displacement(displacement_by_pdgid, disp_hists, n_pu, n_eve
     return total, edges
 
 
+def aggregate_recipe_prompt_weight(displacement_by_pdgid, n_pu, n_events_npz, pdgid_filter=None):
+    """Recipe's own analytic expectation for the number of PROMPT (non-
+    displaced) particles in one N_pu-scaled event -- the natural companion
+    to aggregate_recipe_displacement's displaced weight, using the exact
+    same per-row rate (n_pu * row.n_particles/n_events_npz) but multiplied
+    by (1 - row.displaced_fraction) instead of row.displaced_fraction.
+    There is no shape to distribute this over: a prompt particle sits at
+    literally d3d=0 by construction (see build_pu_sampling_recipe.py's
+    gun-side recipe), so this returns a single number, not a histogram --
+    callers that want to show it alongside a displacement shape plot
+    should put it in one dedicated 'prompt' bin rather than trying to
+    spread it across the log10(d) axis. Same whole-recipe-acceptance-
+    average caveat as aggregate_recipe_displacement applies (row.n_particles
+    is not cone- or eta-window-restricted)."""
+    total = 0.
+    for pid, rows in displacement_by_pdgid.items():
+        if pdgid_filter is not None and not pdgid_filter(pid):
+            continue
+        for row in rows:
+            total += n_pu * (row['n_particles'] / n_events_npz) * (1. - row['displaced_fraction'])
+    return total
+
+
+def _prepend_prompt_bin(edges, sampled_counts, recipe_counts, npz_counts,
+                         n_prompt_sampled, n_prompt_recipe, n_prompt_npz):
+    """Bolt one extra 'prompt' bin (same width as the existing, uniform
+    `edges`) onto the low-d3d end of a displacement shape comparison, so
+    the plot shows the full displaced-vs-prompt picture instead of only
+    the displaced tail's own internal shape -- see aggregate_recipe_
+    prompt_weight's docstring for why a prompt particle (d3d=0 exactly)
+    has no shape of its own to histogram. Each n_prompt_* should already
+    be on the SAME counting convention as that curve's own counts/
+    recipe_counts/npz_counts (raw sampled counts, the recipe's own
+    n_pu-scaled analytic rate, raw or weighted npz counts respectively) --
+    this function only concatenates, it does no rescaling. recipe_counts/
+    npz_counts/n_prompt_recipe/n_prompt_npz may be None together (mirrors
+    _plot_shape_comparison's own None handling) to omit that curve.
+    Returns (full_edges, full_sampled_counts, full_recipe_counts,
+    full_npz_counts)."""
+    bin_width = edges[1] - edges[0]
+    full_edges = np.concatenate(([edges[0] - bin_width], edges))
+    full_sampled = np.concatenate(([n_prompt_sampled], sampled_counts))
+    full_recipe = (np.concatenate(([n_prompt_recipe], recipe_counts))
+                    if recipe_counts is not None else None)
+    full_npz = (np.concatenate(([n_prompt_npz], npz_counts))
+                if npz_counts is not None else None)
+    return full_edges, full_sampled, full_recipe, full_npz
+
+
 # ---------------------------------------------------------------------------
 # Console-only diagnostic: recipe's momentum binning vs a finer npz truth
 # ---------------------------------------------------------------------------
@@ -717,7 +773,8 @@ def _shape_density(counts, widths):
 
 def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_events,
                             cms_label, outfile, xlabel, ylabel, title_extra='',
-                            xscale='linear', yscale='linear', ratio_ylim=(0.5, 1.5)):
+                            xscale='linear', yscale='log', ratio_ylim=(0.5, 1.5),
+                            vline_x=None, vline_label=None):
     """Unit-area SHAPE comparison of up to three curves (sampled always,
     recipe and npz truth optional) that all share ONE set of bin `edges` --
     every caller below passes counts already histogrammed onto the same
@@ -726,7 +783,10 @@ def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_e
     a ratio-of-shapes panel. recipe_counts=None omits the recipe curve/
     ratio (the per-species pt-spectrum plots, see aggregate_recipe_pt's
     docstring); npz_counts=None omits the npz-truth curve/ratio (no --npz
-    given)."""
+    given). vline_x/vline_label: optional dotted vertical marker (e.g. to
+    flag a 'prompt' bin bolted onto an otherwise-continuous axis, see
+    sample_local_pu_around_probe.py's displacement_log10d_cone.png) -- a
+    plain visual cue, does not affect any of the plotted values."""
     widths = np.diff(edges)
     centers = .5 * (edges[:-1] + edges[1:])
     sampled_shape = _shape_density(sampled_counts, widths)
@@ -751,6 +811,12 @@ def _plot_shape_comparison(edges, sampled_counts, recipe_counts, npz_counts, n_e
     if yscale == 'log':
         ax.set_yscale('log')
     ax.set_ylabel(ylabel); ax.legend(fontsize=12)
+    if vline_x is not None:
+        ax.axvline(vline_x, color='gray', linewidth=1, linestyle=':')
+        rax.axvline(vline_x, color='gray', linewidth=1, linestyle=':')
+        if vline_label:
+            ax.annotate(vline_label, xy=(vline_x, ax.get_ylim()[1]), xytext=(4, -4),
+                        textcoords='offset points', fontsize=9, color='gray', va='top')
     if title_extra:
         # A species tag (e.g. "(hadron)") as a plain corner annotation
         # rather than appended to the y-axis label: two adjacent stacked
@@ -898,10 +964,33 @@ def make_control_plots(bins, displacement_by_pdgid, disp_hists, n_events_npz, n_
         npz_disp_counts = np.histogram(npz_log_d, bins=disp_edges)[0]
     else:
         npz_disp_counts = None
-    _plot_shape_comparison(disp_edges, sampled_disp_counts, recipe_disp_counts, npz_disp_counts,
-                            n_events, cms_label, os.path.join(outdir, 'displacement_log10d.png'),
-                            xlabel='log10(3D displacement / cm)',
-                            ylabel='Displacement shape [a.u.]')
+
+    # Prepend a PROMPT (d3d=0) bin, same convention as the cone gun's
+    # displacement_log10d_cone.png -- see aggregate_recipe_prompt_weight
+    # and _prepend_prompt_bin's docstrings. npz's prompt count here is a
+    # plain raw count (no chord/cone weighting -- this script has no cone,
+    # unlike sample_local_pu_around_probe.py), matching npz_disp_counts's
+    # own (also unweighted) convention above.
+    n_prompt_sampled = int((~all_displaced).sum())
+    n_prompt_recipe = aggregate_recipe_prompt_weight(displacement_by_pdgid, n_pu, n_events_npz)
+    n_prompt_npz = int((~npz['displaced']).sum()) if npz is not None else None
+    full_disp_edges, full_sampled_disp_counts, full_recipe_disp_counts, full_npz_disp_counts = \
+        _prepend_prompt_bin(disp_edges, sampled_disp_counts, recipe_disp_counts, npz_disp_counts,
+                             n_prompt_sampled, n_prompt_recipe, n_prompt_npz)
+    n_total_sampled = n_prompt_sampled + int(sampled_disp_counts.sum())
+    n_total_recipe = n_prompt_recipe + recipe_disp_counts.sum()
+    print(f'\nPrompt fraction -- sampled: {n_prompt_sampled}/{n_total_sampled} = '
+          f'{100. * n_prompt_sampled / n_total_sampled:.2f}%; recipe: '
+          f'{100. * n_prompt_recipe / n_total_recipe:.2f}%'
+          + (f'; npz truth: {100. * n_prompt_npz / (n_prompt_npz + npz_disp_counts.sum()):.2f}%'
+             if npz is not None else ''))
+
+    _plot_shape_comparison(full_disp_edges, full_sampled_disp_counts, full_recipe_disp_counts,
+                            full_npz_disp_counts, n_events, cms_label,
+                            os.path.join(outdir, 'displacement_log10d.png'),
+                            xlabel='log10(3D displacement / cm)  (leftmost bin: prompt, d3d=0)',
+                            ylabel='Displacement shape [a.u.]',
+                            vline_x=disp_edges[0], vline_label='prompt | displaced')
 
     # --- Plots 6-13: same two quantities (pt spectrum, displacement), each
     # split into the four SPECIES_GROUPS (photon/electron/muon/hadron), so
@@ -957,11 +1046,23 @@ def make_control_plots(bins, displacement_by_pdgid, disp_hists, n_events_npz, n_
             group_npz_disp_counts = np.histogram(group_npz_log_d, bins=disp_edges)[0]
         else:
             group_npz_disp_counts = None
-        _plot_shape_comparison(disp_edges, group_sampled_disp_counts, group_recipe_disp_counts,
-                                group_npz_disp_counts, n_events, cms_label,
+
+        # Same prepended PROMPT bin as the aggregate displacement_log10d.png
+        # above, restricted to this species group throughout.
+        group_n_prompt_sampled = int((sampled_mask & ~all_displaced).sum())
+        group_n_prompt_recipe = aggregate_recipe_prompt_weight(
+            displacement_by_pdgid, n_pu, n_events_npz, pdgid_filter=group_sel)
+        group_n_prompt_npz = (int((group_sel(npz['pdgId']) & ~npz['displaced']).sum())
+                                if npz is not None else None)
+        group_full_edges, group_full_sampled, group_full_recipe, group_full_npz = _prepend_prompt_bin(
+            disp_edges, group_sampled_disp_counts, group_recipe_disp_counts, group_npz_disp_counts,
+            group_n_prompt_sampled, group_n_prompt_recipe, group_n_prompt_npz)
+        _plot_shape_comparison(group_full_edges, group_full_sampled, group_full_recipe,
+                                group_full_npz, n_events, cms_label,
                                 os.path.join(outdir, f'displacement_log10d_{group_name}.png'),
-                                xlabel='log10(3D displacement / cm)',
-                                ylabel='Displacement shape [a.u.]', title_extra=title_extra)
+                                xlabel='log10(3D displacement / cm)  (leftmost bin: prompt, d3d=0)',
+                                ylabel='Displacement shape [a.u.]', title_extra=title_extra,
+                                vline_x=disp_edges[0], vline_label='prompt | displaced')
 
     if npz is not None:
         print_species_momentum_table(npz, all_pdgids, all_ps, all_displaced,
