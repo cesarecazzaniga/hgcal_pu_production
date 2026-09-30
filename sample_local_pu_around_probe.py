@@ -353,6 +353,23 @@ def npz_displacement_truth_in_cone(npz, eta_probe, cone_radius, disp_edges):
     return counts, int(in_window.sum()), int(displaced_in_window.sum())
 
 
+def npz_prompt_weight_in_cone(npz, eta_probe, cone_radius):
+    """Chord-weighted PROMPT (non-displaced) count from npz particles
+    within the disk's eta extent -- same weighting and same eta-window
+    restriction as npz_displacement_truth_in_cone, just for the
+    complementary (non-displaced) subset, and returning a single number
+    (there's no shape to a prompt spike, it's all at d3d=0) rather than a
+    histogram. On the same unscaled 'raw npz weighted count' footing as
+    npz_displacement_truth_in_cone's returned counts, so the two can sit
+    in the same shape comparison as a 'prompt' bin next to the displaced
+    log10(d) bins."""
+    d_eta = npz['eta'] - eta_probe
+    in_window = np.abs(d_eta) <= cone_radius
+    weights = _chord_weight(d_eta[in_window], cone_radius)
+    prompt_in_window = ~npz['displaced'][in_window]
+    return float(weights[prompt_in_window].sum()), int(prompt_in_window.sum())
+
+
 def npz_radial_profile_in_cone(npz, eta_probe, cone_radius, r_edges, n_events_npz, n_pu, n_fine=200):
     """High-statistics npz-truth dN/dR shape: build a FINE per-unit-eta
     density from ALL npz particles within the disk's eta extent (no phi
@@ -658,7 +675,11 @@ def main():
     # chord-weighted within the disk's eta window (npz_displacement_truth_
     # in_cone), NOT the full unrestricted sample -- see that function's
     # docstring. Same --n_plot_bins rebinning as pt above, linear this
-    # time (the quantity is already log10(displacement)). ---
+    # time (the quantity is already log10(displacement)). ALSO includes a
+    # prepended PROMPT (d3d=0) bin for all three curves, so the plot shows
+    # the full displaced-vs-prompt picture, not just the displaced tail's
+    # internal shape -- see aggregate_recipe_prompt_weight/
+    # npz_prompt_weight_in_cone below. ---
     recipe_disp_counts, disp_edges = spe.aggregate_recipe_displacement(
         displacement_by_pdgid, disp_hists, args.n_pu, n_events_npz)
     if args.n_plot_bins:
@@ -674,10 +695,52 @@ def main():
         print(f'npz-truth displacement shape: {n_npz_in_window} npz particles in the disk\'s eta '
               f'window ({n_npz_displaced} displaced), chord-width weighted -- NOT the full '
               f'unrestricted npz sample, see module docstring.')
-    spe._plot_shape_comparison(disp_edges, sampled_disp_counts, recipe_disp_counts, npz_disp_counts,
-                                args.n_events, args.cms_label,
+
+    # --- prepend a PROMPT bin (d3d=0, no shape to it) so the plot shows
+    # the full picture -- displaced tail AND how it compares to the much
+    # larger prompt population -- instead of only the displaced shape's
+    # own internal structure. One extra bin, same width as the existing
+    # (uniform) disp_edges, immediately below the displaced_threshold
+    # boundary; a dotted vline marks where 'prompt' ends and the real
+    # log10(d) axis begins, since the prompt bin's x-position is a bolted-
+    # on placeholder, not a displacement value. Each curve's prompt count
+    # uses THAT curve's own existing counting convention (see
+    # aggregate_recipe_prompt_weight / npz_prompt_weight_in_cone
+    # docstrings), so it sits on the same footing as that curve's own
+    # displaced-bin counts and the unit-area shape normalization handles
+    # the rest. ---
+    bin_width = disp_edges[1] - disp_edges[0]
+    full_disp_edges = np.concatenate(([disp_edges[0] - bin_width], disp_edges))
+
+    n_prompt_sampled = int((~all_displaced).sum())
+    full_sampled_disp_counts = np.concatenate(([n_prompt_sampled], sampled_disp_counts))
+
+    n_prompt_recipe = spe.aggregate_recipe_prompt_weight(displacement_by_pdgid, args.n_pu, n_events_npz)
+    full_recipe_disp_counts = np.concatenate(([n_prompt_recipe], recipe_disp_counts))
+
+    full_npz_disp_counts = None
+    if npz is not None:
+        n_prompt_npz, n_npz_prompt_particles = npz_prompt_weight_in_cone(
+            npz, args.eta_probe, args.cone_radius)
+        full_npz_disp_counts = np.concatenate(([n_prompt_npz], npz_disp_counts))
+        print(f'npz-truth prompt weight: {n_npz_prompt_particles} non-displaced npz particles in the '
+              f'disk\'s eta window, chord-width weighted -> {n_prompt_npz:.3f} (same convention as '
+              f'the displaced weight above).')
+
+    n_total_sampled = n_prompt_sampled + int(sampled_disp_counts.sum())
+    n_total_recipe = n_prompt_recipe + recipe_disp_counts.sum()
+    print(f'Prompt fraction -- sampled: {n_prompt_sampled}/{n_total_sampled} = '
+          f'{100. * n_prompt_sampled / n_total_sampled:.2f}%; recipe (own bins): '
+          f'{100. * n_prompt_recipe / n_total_recipe:.2f}%'
+          + (f'; npz truth: {100. * n_prompt_npz / (n_prompt_npz + npz_disp_counts.sum()):.2f}%'
+             if npz is not None else ''))
+
+    spe._plot_shape_comparison(full_disp_edges, full_sampled_disp_counts, full_recipe_disp_counts,
+                                full_npz_disp_counts, args.n_events, args.cms_label,
                                 os.path.join(args.outdir, 'displacement_log10d_cone.png'),
-                                xlabel='log10(3D displacement / cm)', ylabel='Displacement shape [a.u.]')
+                                xlabel='log10(3D displacement / cm)  (leftmost bin: prompt, d3d=0)',
+                                ylabel='Displacement shape [a.u.]',
+                                vline_x=disp_edges[0], vline_label='prompt | displaced')
     if args.n_plot_bins:
         print(f'\n--n_plot_bins={args.n_plot_bins}: pt, displacement, and radial-profile plots all '
               f'rebinned to {args.n_plot_bins} bins each.')
